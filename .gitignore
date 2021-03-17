@@ -10,6 +10,8 @@ events
 __pycache__/
 *.py[cod]
 *$py.class
+/runs
+/wandb
 
 # C extensions
 *.so

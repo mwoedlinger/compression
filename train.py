@@ -1,268 +1,266 @@
-import os
+import logging
 import argparse
-from model import *
+import copy
+from tqdm import tqdm
+import random
+from collections import namedtuple
+from pathlib import Path
+import wandb
+
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import json
-import time
-from datasets import Datasets, TestKodakDataset
-from tensorboardX import SummaryWriter
-from Meter import AverageMeter
+import torch.nn as nn
+from torchvision import transforms
+
+from model import *
+
+import aiutils
+import aiutils.schedule as schedule
+import aiutils.logger as log
+from aiutils import *
+from aiutils.dataset import ImageDataloader
+from aiutils.losses import MSELoss
+from aiutils.metrics import psnr, ms_ssim
+
+logging.getLogger().setLevel(logging.INFO)
+random.seed(42)
+torch.manual_seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+config_defaults = {
+    'project': 'balle',
+    'entity': 'aistream',
+
+    'train': 'clic_professional',
+    'eval': 'kodak',
+    'batch_size': 1,
+    'lr': 1e-4,
+    'epochs': 1000,  # lr drop after 2000 epochs, clic_mobile
+    'eval_steps': 1,
+
+    'lambda_loss': 4096,
+    'debug': False,
+    'device': get_free_gpu(),
+    'num_workers': 2,
+
+    'entropy_cdf': 'laplacian_cdf',
+
+    'optim': {
+        'name': 'Adam',
+        'kwargs': {}
+    },
+
+    'resume': False,
+    'scheduler': {
+        'name': 'ExponentialLR',
+        'steps': 350 * 1000,
+        'kwargs': {
+            'gamma': 0.5,
+        }
+    },
+    'log': {  # Log: log_steps pairs
+        # SCALARS:
+        'loss': 10,
+        'rate': 10,
+        'distortion': 10,
+        'psnr': 10,
+        'bpp_z': 10,
+        'bpp_feature': 10,
+
+        # IMAGES
+        'prediction': 100,
+        'prediction_all': 1000
+    },
+    'eval_metric': 'loss'  # eval models are compared with respect to this metric
+
+}
 
 
-torch.backends.cudnn.enabled = True
-# gpu_num = 4
-gpu_num = torch.cuda.device_count()
-cur_lr = base_lr = 1e-4#  * gpu_num
-train_lambda = 8192
-print_freq = 100
-cal_step = 40
-warmup_step = 0#  // gpu_num
-batch_size = 4
-tot_epoch = 1000000
-tot_step = 2500000
-decay_interval = 2200000
-lr_decay = 0.1
-image_size = 256
-logger = logging.getLogger("ImageCompression")
-tb_logger = None
-global_step = 0
-save_model_freq = 50000
-test_step = 10000
-out_channel_N = 192
-out_channel_M = 320
-parser = argparse.ArgumentParser(description='Pytorch reimplement for variational image compression with a scale hyperprior')
-
-parser.add_argument('-n', '--name', default='', help='experiment name')
-parser.add_argument('-p', '--pretrain', default='', help='load pretrain model')
-parser.add_argument('--test', action='store_true')
-parser.add_argument('--config', dest='config', required=False, help='hyperparameter in json format')
-parser.add_argument('--seed', default=234, type=int, help='seed for random functions, and network initialization')
-parser.add_argument('--train', dest='train', required=True, help='the path of training dataset')
-parser.add_argument('--val', dest='val', required=True, help='the path of validation dataset')
+def clip_gradient(optimizer, grad_clip):
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                param.grad.data.clamp_(-grad_clip, grad_clip)
 
 
-def parse_config(config):
-    config = json.load(open(args.config))
-    global tot_epoch, tot_step, base_lr, cur_lr, lr_decay, decay_interval, train_lambda, batch_size, print_freq, \
-        out_channel_M, out_channel_N, save_model_freq, test_step
-    if 'tot_epoch' in config:
-        tot_epoch = config['tot_epoch']
-    if 'tot_step' in config:
-        tot_step = config['tot_step']
-    if 'train_lambda' in config:
-        train_lambda = config['train_lambda']
-        if train_lambda < 4096:
-            out_channel_N = 128
-            out_channel_M = 192
+def rate_distortion_loss(rate, distortion, l):
+    return torch.mean((rate + l*distortion)/(1 + l))
+
+
+class Trainer(BaseTrainer):
+    def __init__(self, config):
+        super().__init__(config)
+
+        #### DATALOADER ####
+        data_transforms = {
+            'train': transforms.Compose([
+                transforms.RandomCrop(256),
+                transforms.ToTensor()]),
+            'eval': transforms.Compose([
+                transforms.CenterCrop(256),
+                transforms.ToTensor()])
+        }
+        shuffle_dict = {'train': True, 'eval': False}
+
+        self.dataloaders = {
+            ds_type: ImageDataloader(ds_name=getattr(config, ds_type), ds_type=ds_type,
+                                     transforms=data_transforms[ds_type], **config._asdict())
+            for ds_type in ['train', 'eval']}
+
+        #### MODEL, OPTIMIZER, SCHEDULER ####
+        self.model = ImageCompressor(128, 192).to(self.device)
+        print(
+            f'Model {type(self.model).__name__} has {get_parameter_count(self.model)} trainable parameters.')
+        self.optimizer = getattr(torch.optim, config.optim['name'])(
+            params=self.model.parameters(), lr=config.lr, **config.optim['kwargs'])
+        if config.scheduler is None:
+            self.scheduler = None
         else:
-            out_channel_N = 192
-            out_channel_M = 320
-    if 'batch_size' in config:
-        batch_size = config['batch_size']
-    if "print_freq" in config:
-        print_freq = config['print_freq']
-    if "test_step" in config:
-        test_step = config['test_step']
-    if "save_model_freq" in config:
-        save_model_freq = config['save_model_freq']
-    if 'lr' in config:
-        if 'base' in config['lr']:
-            base_lr = config['lr']['base']
-            cur_lr = base_lr
-        if 'decay' in config['lr']:
-            lr_decay = config['lr']['decay']
-        if 'decay_interval' in config['lr']:
-            decay_interval = config['lr']['decay_interval']
-    if 'out_channel_N' in config:
-        out_channel_N = config['out_channel_N']
-    if 'out_channel_M' in config:
-        out_channel_M = config['out_channel_M']
+            self.scheduler = getattr(torch.optim.lr_scheduler, config.scheduler['name'])(
+                optimizer=self.optimizer, **config.scheduler['kwargs'])
+            schedule.every(config.scheduler['steps']).steps.do(
+                self.scheduler.step)
+
+        if config.resume:
+            self._resume_checkpoint(Path(config.resume))
+
+        # DEFINE CRITERION
+        self.criterion = MSELoss().to(self.device)
+
+        #### LOGGING ####
+        if not config.debug:
+            wandb.init(project=config.project, entity=config.entity,
+                       config=config._asdict())
+            wandb.watch(self.model, log='all', log_freq=1000)
+            wandb.save(__file__)
+            self._create_output_folder(wandb.run.name, __file__)
+
+        # schedule.every(10).steps.do(log.value_print, 'train', 'loss')
+        assert config.eval_metric in config.log, f'eval metric {config.eval_metric} not logged!'
+        for name in config.log:
+            log_steps = config.log[name]
+            schedule.every(log_steps).steps.do(log.commit_wb, 'train', name)
+
+    def _train_epoch(self):
+        self.model.train()
+        logger = log.get_logger('train')
+
+        for inputs, idx in tqdm(self.dataloaders['train']):
+            inputs = inputs.to(self.device)
+
+            # forward
+            self.optimizer.zero_grad()
+
+            clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = self.model(
+                inputs)
+            rate = bpp
+            distortion = mse_loss
+
+            # backward
+            loss = rate_distortion_loss(rate, distortion, config.lambda_loss)
+            loss.backward()
+            clip_gradient(self.optimizer, 5)
+            self.optimizer.step()
+
+            logger.log(loss=log.mean(loss),
+                       rate=log.mean(rate),
+                       distortion=log.mean(distortion*255**2),
+                       bpp_z=log.mean(bpp_z),
+                       bpp_feature=log.mean(bpp_feature),
+                       psnr=log.mean(psnr(clipped_recon_image, inputs)),
+                       prediction=log.image(
+                           torch.cat((inputs, clipped_recon_image)).unsqueeze(0), nrow=2),
+                       prediction_all=log.image_grid(clipped_recon_image))
+
+            schedule.step()
+
+    def _eval_epoch(self):
+        self.model.eval()
+        logger = log.get_logger('eval')
+
+        for inputs, idx in tqdm(self.dataloaders['eval']):
+            inputs = inputs.to(self.device)
+
+            # forward
+            with torch.set_grad_enabled(False):
+
+                clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = self.model(
+                    inputs)
+                rate = bpp
+                distortion = mse_loss
+                loss = rate_distortion_loss(
+                    rate, distortion, config.lambda_loss)
+
+                logger.log(loss=log.mean(loss),
+                           rate=log.mean(rate),
+                           distortion=log.mean(distortion*255**2),
+                           bpp_z=log.mean(bpp_z),
+                           bpp_feature=log.mean(bpp_feature),
+                           psnr=log.mean(
+                               psnr(clipped_recon_image, inputs)),
+                           prediction=log.image(
+                               torch.cat((inputs, clipped_recon_image)).unsqueeze(0), nrow=2),
+                           prediction_all=log.image_grid(clipped_recon_image))
+
+    def train(self):
+        best_model = None
+        best_result = float('inf')
+
+        eval_scheduler = schedule.Scheduler()
+        # EVALUATION METHOD
+
+        def eval_model():
+            nonlocal best_model, best_result
+            self._eval_epoch()
+
+            eval_result = log.get_value('eval', config.eval_metric)
+            if eval_result < best_result:
+                best_result = eval_result
+                best_model = copy.deepcopy(self.model.state_dict())
+
+                logging.info(
+                    f'## New best loss = {best_result}. Save model as new best!')
+                self._save_model('model_best.pt')
+
+            for name in config.log:
+                log.commit_wb('eval', name)
+        eval_scheduler.every(config.eval_steps).steps.do(eval_model)
+
+        # TRAINING LOOP
+        for epoch in range(self.start_epoch, config.epochs):
+            logging.info('## Epoch {}/{}'.format(epoch, config.epochs - 1))
+            self._train_epoch()
+            self._save_checkpoint(epoch)
+            eval_scheduler.step()
+
+        logging.info(f'## Training completed! best loss = {best_result}')
+
+        return best_model
 
 
-def adjust_learning_rate(optimizer, global_step):
-    global cur_lr
-    global warmup_step
-    if global_step < warmup_step:
-        lr = base_lr * global_step / warmup_step
-    elif global_step < decay_interval:#  // gpu_num:
-        lr = base_lr
-    else:
-        # lr = base_lr * (lr_decay ** (global_step // decay_interval))
-        lr = base_lr * lr_decay
-    cur_lr = lr
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-def train(epoch, global_step):
-    logger.info("Epoch {} begin".format(epoch))
-    net.train()
-    global optimizer
-    elapsed, losses, psnrs, bpps, bpp_features, bpp_zs, mse_losses = [AverageMeter(print_freq) for _ in range(7)]
-    # model_time = 0
-    # compute_time = 0
-    # log_time = 0
-    for batch_idx, input in enumerate(train_loader):
-        start_time = time.time()
-        global_step += 1
-        # print("debug", torch.max(input), torch.min(input))
-        clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = net(input)
-        # print("debug", clipped_recon_image.shape, " ", mse_loss.shape, " ", bpp.shape)
-        # print("debug", mse_loss, " ", bpp_feature, " ", bpp_z, " ", bpp)
-        distribution_loss = bpp
-        distortion = mse_loss
-        rd_loss = train_lambda * distortion + distribution_loss
-        optimizer.zero_grad()
-        rd_loss.backward()
-
-        def clip_gradient(optimizer, grad_clip):
-            for group in optimizer.param_groups:
-                for param in group["params"]:
-                    if param.grad is not None:
-                        param.grad.data.clamp_(-grad_clip, grad_clip)
-        clip_gradient(optimizer, 5)
-        optimizer.step()
-        # model_time += (time.time()-start_time)
-        if (global_step % cal_step) == 0:
-            # t0 = time.time()
-            if mse_loss.item() > 0:
-                psnr = 10 * (torch.log(1 * 1 / mse_loss) / np.log(10))
-                psnrs.update(psnr.item())
-            else:
-                psnrs.update(100)
-            # t1 = time.time()
-            elapsed.update(time.time() - start_time)
-            losses.update(rd_loss.item())
-            bpps.update(bpp.item())
-            bpp_features.update(bpp_feature.item())
-            bpp_zs.update(bpp_z.item())
-            mse_losses.update(mse_loss.item())
-
-        if (global_step % print_freq) == 0:
-            # begin = time.time()
-            tb_logger.add_scalar('lr', cur_lr, global_step)
-            tb_logger.add_scalar('rd_loss', losses.avg, global_step)
-            tb_logger.add_scalar('psnr', psnrs.avg, global_step)
-            tb_logger.add_scalar('bpp', bpps.avg, global_step)
-            tb_logger.add_scalar('bpp_feature', bpp_features.avg, global_step)
-            tb_logger.add_scalar('bpp_z', bpp_zs.avg, global_step)
-            process = global_step / tot_step * 100.0
-            log = (' | '.join([
-                f'Step [{global_step}/{tot_step}={process:.2f}%]',
-                f'Epoch {epoch}',
-                f'Time {elapsed.val:.3f} ({elapsed.avg:.3f})',
-                f'Lr {cur_lr}',
-                f'Total Loss {losses.val:.3f} ({losses.avg:.3f})',
-                f'PSNR {psnrs.val:.3f} ({psnrs.avg:.3f})',
-                f'Bpp {bpps.val:.5f} ({bpps.avg:.5f})',
-                f'Bpp_feature {bpp_features.val:.5f} ({bpp_features.avg:.5f})',
-                f'Bpp_z {bpp_zs.val:.5f} ({bpp_zs.avg:.5f})',
-                f'MSE {mse_losses.val:.5f} ({mse_losses.avg:.5f})',
-            ]))
-            logger.info(log)
-
-        if (global_step % save_model_freq) == 0:
-            save_model(model, global_step, save_path)
-        if (global_step % test_step) == 0:
-            testKodak(global_step)
-            net.train()
-
-    return global_step
-
-
-def testKodak(step):
-    with torch.no_grad():
-        net.eval()
-        sumBpp = 0
-        sumPsnr = 0
-        sumMsssim = 0
-        sumMsssimDB = 0
-        cnt = 0
-        for batch_idx, input in enumerate(test_loader):
-            clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = net(input)
-            mse_loss, bpp_feature, bpp_z, bpp = \
-                torch.mean(mse_loss), torch.mean(bpp_feature), torch.mean(bpp_z), torch.mean(bpp)
-            psnr = 10 * (torch.log(1. / mse_loss) / np.log(10))
-            sumBpp += bpp
-            sumPsnr += psnr
-            msssim = ms_ssim(clipped_recon_image.cpu().detach(), input, data_range=1.0, size_average=True)
-            msssimDB = -10 * (torch.log(1-msssim) / np.log(10))
-            sumMsssimDB += msssimDB
-            sumMsssim += msssim
-            logger.info("Bpp:{:.6f}, PSNR:{:.6f}, MS-SSIM:{:.6f}, MS-SSIM-DB:{:.6f}".format(bpp, psnr, msssim, msssimDB))
-            cnt += 1
-
-        logger.info("Test on Kodak dataset: model-{}".format(step))
-        sumBpp /= cnt
-        sumPsnr /= cnt
-        sumMsssim /= cnt
-        sumMsssimDB /= cnt
-        logger.info("Dataset Average result---Bpp:{:.6f}, PSNR:{:.6f}, MS-SSIM:{:.6f}, MS-SSIM-DB:{:.6f}".format(sumBpp, sumPsnr, sumMsssim, sumMsssimDB))
-        if tb_logger !=None:
-            logger.info("Add tensorboard---Step:{}".format(step))
-            tb_logger.add_scalar("BPP_Test", sumBpp, step)
-            tb_logger.add_scalar("PSNR_Test", sumPsnr, step)
-            tb_logger.add_scalar("MS-SSIM_Test", sumMsssim, step)
-            tb_logger.add_scalar("MS-SSIM_DB_Test", sumMsssimDB, step)
-        else:
-            logger.info("No need to add tensorboard")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        argument_default=argparse.SUPPRESS)  # filter none items
+    parser.add_argument('--project', type=str, help='project name')
+    parser.add_argument('--entity', type=str, help='entity name')
+    parser.add_argument('--train', type=str, help='Train dataset')
+    parser.add_argument('--eval', type=str, help='Validation dataset')
+    parser.add_argument('--device', type=int, help='The gpu to use')
+    parser.add_argument('--batch_size', type=int, help='Batch size')
+    parser.add_argument('--lr', type=float, help='Learning rate')
+    parser.add_argument('--epochs', type=int, help='Number of epochs')
+    parser.add_argument('--debug', action='store_true', help='Debug')
+    parser.add_argument('--resume', type=str, help='Resume from checkpoint')
     args = parser.parse_args()
-    torch.manual_seed(seed=args.seed)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s] %(message)s')
-    formatter = logging.Formatter('[%(asctime)s][%(filename)s][L%(lineno)d][%(levelname)s] %(message)s')
-    stdhandler = logging.StreamHandler()
-    stdhandler.setLevel(logging.INFO)
-    stdhandler.setFormatter(formatter)
-    logger.addHandler(stdhandler)
-    tb_logger = None
-    save_path = os.path.join('checkpoints', args.name)
-    if args.name != '':
-        os.makedirs(save_path, exist_ok=True)
-        filehandler = logging.FileHandler(os.path.join(save_path, 'log.txt'))
-        filehandler.setLevel(logging.INFO)
-        filehandler.setFormatter(formatter)
-        logger.addHandler(filehandler)
-    logger.setLevel(logging.INFO)
-    logger.info("image compression training")
-    logger.info("config : ")
-    logger.info(open(args.config).read())
-    parse_config(args.config)
-    logger.info("out_channel_N:{}, out_channel_M:{}".format(out_channel_N, out_channel_M))
-    model = ImageCompressor(out_channel_N, out_channel_M)
-    if args.pretrain != '':
-        logger.info("loading model:{}".format(args.pretrain))
-        global_step = load_model(model, args.pretrain)
-    net = model.cuda()
-    net = torch.nn.DataParallel(net, list(range(gpu_num)))
-    parameters = net.parameters()
-    global test_loader
-    test_dataset = TestKodakDataset(data_dir=args.val)
-    test_loader = DataLoader(dataset=test_dataset, shuffle=False, batch_size=1, pin_memory=True, num_workers=1)
-    if args.test:
-        testKodak(global_step)
-        exit(-1)
-    optimizer = optim.Adam(parameters, lr=base_lr)
-    # save_model(model, 0)
-    global train_loader
-    tb_logger = SummaryWriter(os.path.join(save_path, 'events'))
-    train_data_dir = args.train
-    train_dataset = Datasets(train_data_dir, image_size)
-    train_loader = DataLoader(dataset=train_dataset,
-                              batch_size=batch_size,
-                              shuffle=True,
-                              pin_memory=True,
-                              num_workers=2)
-    steps_epoch = global_step // (len(train_dataset) // (batch_size))
-    save_model(model, global_step, save_path)
-    for epoch in range(steps_epoch, tot_epoch):
-        adjust_learning_rate(optimizer, global_step)
-        if global_step > tot_step:
-            save_model(model, global_step, save_path)
-            break
-        global_step = train(epoch, global_step)
-        save_model(model, global_step, save_path)
+
+    # make named tuple with defaults
+    config = namedtuple(
+        'Config', config_defaults, defaults=config_defaults.values())(**vars(args))
+
+    print('\n' + 15*'#' + ' Train config ' + 15*'#')
+    for k in config._fields:
+        print(f'{k:15}: {getattr(config, k)}')
+    print(44*'#' + '\n')
+
+    trainer = Trainer(config)
+    trainer.train()

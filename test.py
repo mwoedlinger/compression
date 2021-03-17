@@ -7,16 +7,16 @@ from torch.utils.data import DataLoader
 import json
 import time
 from datasets import Datasets, TestKodakDataset
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from Meter import AverageMeter
 torch.backends.cudnn.enabled = True
 # gpu_num = 4
-gpu_num = torch.cuda.device_count()
-cur_lr = base_lr = 1e-4#  * gpu_num
+gpu_num = 1  # torch.cuda.device_count()
+cur_lr = base_lr = 1e-4  # * gpu_num
 train_lambda = 8192
 print_freq = 100
 cal_step = 40
-warmup_step = 0#  // gpu_num
+warmup_step = 0  # // gpu_num
 batch_size = 4
 tot_epoch = 1000000
 tot_step = 2500000
@@ -30,18 +30,21 @@ save_model_freq = 50000
 test_step = 10000
 out_channel_N = 192
 out_channel_M = 320
-parser = argparse.ArgumentParser(description='Pytorch reimplement for variational image compression with a scale hyperprior')
+parser = argparse.ArgumentParser(
+    description='Pytorch reimplement for variational image compression with a scale hyperprior')
 
 parser.add_argument('-n', '--name', default='',
-        help='output training details')
-parser.add_argument('-p', '--pretrain', default = '',
-        help='load pretrain model')
+                    help='output training details')
+parser.add_argument('-p', '--pretrain', default='',
+                    help='load pretrain model')
 parser.add_argument('-t', '--test', default='',
-        help='test dataset')
+                    help='test dataset')
 parser.add_argument('--config', dest='config', required=False,
-        help = 'hyperparameter in json format')
-parser.add_argument('--seed', default=234, type=int, help='seed for random functions, and network initialization')
-parser.add_argument('--val', dest='val_path', required=True, help='the path of validation dataset')
+                    help='hyperparameter in json format')
+parser.add_argument('--seed', default=234, type=int,
+                    help='seed for random functions, and network initialization')
+parser.add_argument('--val', dest='val_path', required=True,
+                    help='the path of validation dataset')
 
 
 def parse_config(config):
@@ -93,30 +96,35 @@ def test(step):
         for batch_idx, input in enumerate(test_loader):
             clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = net(input)
             mse_loss, bpp_feature, bpp_z, bpp = \
-                torch.mean(mse_loss), torch.mean(bpp_feature), torch.mean(bpp_z), torch.mean(bpp)
+                torch.mean(mse_loss), torch.mean(
+                    bpp_feature), torch.mean(bpp_z), torch.mean(bpp)
             psnr = 10 * (torch.log(1. / mse_loss) / np.log(10))
             sumBpp += bpp
             sumPsnr += psnr
-            msssim = ms_ssim(clipped_recon_image.cpu().detach(), input, data_range=1.0, size_average=True)
+            msssim = ms_ssim(clipped_recon_image.cpu().detach(),
+                             input, data_range=1.0, size_average=True)
             msssimDB = -10 * (torch.log(1-msssim) / np.log(10))
             sumMsssimDB += msssimDB
             sumMsssim += msssim
             cnt += 1
-            logger.info("Num: {}, Bpp:{:.6f}, PSNR:{:.6f}, MS-SSIM:{:.6f}, MS-SSIM-DB:{:.6f}".format(cnt, bpp, psnr, msssim, msssimDB))
+            logger.info("Num: {}, Bpp:{:.6f}, PSNR:{:.6f}, MS-SSIM:{:.6f}, MS-SSIM-DB:{:.6f}".format(
+                cnt, bpp, psnr, msssim, msssimDB))
 
         logger.info("Test on Kodak dataset: model-{}".format(step))
         sumBpp /= cnt
         sumPsnr /= cnt
         sumMsssim /= cnt
         sumMsssimDB /= cnt
-        logger.info("Dataset Average result---Dataset Num: {}, Bpp:{:.6f}, PSNR:{:.6f}, MS-SSIM:{:.6f}, MS-SSIM-DB:{:.6f}".format(cnt, sumBpp, sumPsnr, sumMsssim, sumMsssimDB))
+        logger.info("Dataset Average result---Dataset Num: {}, Bpp:{:.6f}, PSNR:{:.6f}, MS-SSIM:{:.6f}, MS-SSIM-DB:{:.6f}".format(
+            cnt, sumBpp, sumPsnr, sumMsssim, sumMsssimDB))
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
     torch.manual_seed(seed=args.seed)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s] %(message)s')
-    formatter = logging.Formatter('[%(asctime)s][%(filename)s][L%(lineno)d][%(levelname)s] %(message)s')
+    formatter = logging.Formatter(
+        '[%(asctime)s][%(filename)s][L%(lineno)d][%(levelname)s] %(message)s')
     stdhandler = logging.StreamHandler()
     stdhandler.setLevel(logging.INFO)
     stdhandler.setFormatter(formatter)
@@ -127,17 +135,19 @@ if __name__ == "__main__":
     logger.info("config : ")
     logger.info(open(args.config).read())
     parse_config(args.config)
-    logger.info("out_channel_N:{}, out_channel_M:{}".format(out_channel_N, out_channel_M))
+    logger.info("out_channel_N:{}, out_channel_M:{}".format(
+        out_channel_N, out_channel_M))
     model = ImageCompressor(out_channel_N, out_channel_M)
     if args.pretrain != '':
         logger.info("loading model:{}".format(args.pretrain))
         global_step = load_model(model, args.pretrain)
-    net = model.cuda()
-    net = torch.nn.DataParallel(net, list(range(gpu_num)))
+    net = model.to(torch.device(1))
+    #net = torch.nn.DataParallel(net, list(range(gpu_num)))
     global test_loader
     if args.test == 'kodak':
         test_dataset = TestKodakDataset(data_dir=args.val_path)
         logger.info("No test dataset")
         exit(-1)
-    test_loader = DataLoader(dataset=test_dataset, shuffle=False, batch_size=1, pin_memory=True)
+    test_loader = DataLoader(dataset=test_dataset,
+                             shuffle=False, batch_size=1, pin_memory=True)
     test(global_step)
