@@ -20,6 +20,7 @@ from aiutils import *
 from aiutils.dataset import ImageDataloader
 from aiutils.losses import MSELoss
 from aiutils.metrics import psnr, ms_ssim
+from aiutils.transforms import CropCityscapesArtefacts
 
 logging.getLogger().setLevel(logging.INFO)
 random.seed(42)
@@ -28,22 +29,20 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 config_defaults = {
-    'project': 'balle',
+    'project': 'cityscapes-balle',
     'entity': 'aistream',
 
-    'train': 'clic_professional',
-    'eval': 'kodak',
+    'train': 'cityscapes',
+    'eval': 'cityscapes',
     'batch_size': 1,
     'lr': 1e-4,
-    'epochs': 1000,  # lr drop after 2000 epochs, clic_mobile
-    'eval_steps': 1,
+    'steps': 1500000,
+    'eval_steps': 2000,
 
-    'lambda_loss': 4096,
+    'lambda_loss': 0.05,
     'debug': False,
-    'device': get_free_gpu(),
+    'device': 3,  # get_free_gpu(),
     'num_workers': 2,
-
-    'entropy_cdf': 'laplacian_cdf',
 
     'optim': {
         'name': 'Adam',
@@ -53,23 +52,23 @@ config_defaults = {
     'resume': False,
     'scheduler': {
         'name': 'ExponentialLR',
-        'steps': 350 * 1000,
+        'steps': 300000,
         'kwargs': {
             'gamma': 0.5,
         }
     },
     'log': {  # Log: log_steps pairs
         # SCALARS:
-        'loss': 10,
-        'rate': 10,
-        'distortion': 10,
-        'psnr': 10,
-        'bpp_z': 10,
-        'bpp_feature': 10,
+        'loss': 100,
+        'rate': 100,
+        'distortion': 100,
+        'psnr': 100,
+        'bpp_z': 100,
+        'bpp_feature': 100,
 
         # IMAGES
-        'prediction': 100,
-        'prediction_all': 1000
+        'prediction': 1000
+        # 'prediction_all': 1000
     },
     'eval_metric': 'loss'  # eval models are compared with respect to this metric
 
@@ -94,16 +93,18 @@ class Trainer(BaseTrainer):
         #### DATALOADER ####
         data_transforms = {
             'train': transforms.Compose([
+                CropCityscapesArtefacts(),
                 transforms.RandomCrop(256),
                 transforms.ToTensor()]),
             'eval': transforms.Compose([
-                transforms.CenterCrop(256),
+                CropCityscapesArtefacts(),
+                # transforms.CenterCrop(512),
                 transforms.ToTensor()])
         }
         shuffle_dict = {'train': True, 'eval': False}
 
         self.dataloaders = {
-            ds_type: ImageDataloader(ds_name=getattr(config, ds_type), ds_type=ds_type,
+            ds_type: ImageDataloader(ds_name=getattr(config, ds_type), ds_type=ds_type, shuffle=shuffle_dict[ds_type],
                                      transforms=data_transforms[ds_type], **config._asdict())
             for ds_type in ['train', 'eval']}
 
@@ -128,9 +129,13 @@ class Trainer(BaseTrainer):
         self.criterion = MSELoss().to(self.device)
 
         #### LOGGING ####
+        if config.resume:
+            self.wandb_id = self._resume_checkpoint(Path(config.resume))
+
+        log.debug = config.debug
         if not config.debug:
             wandb.init(project=config.project, entity=config.entity,
-                       config=config._asdict())
+                       config=config._asdict(), id=self.wandb_id, resume='allow')
             wandb.watch(self.model, log='all', log_freq=1000)
             wandb.save(__file__)
             self._create_output_folder(wandb.run.name, __file__)
@@ -154,7 +159,7 @@ class Trainer(BaseTrainer):
             clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = self.model(
                 inputs)
             rate = bpp
-            distortion = mse_loss
+            distortion = mse_loss*255**2
 
             # backward
             loss = rate_distortion_loss(rate, distortion, config.lambda_loss)
@@ -164,7 +169,7 @@ class Trainer(BaseTrainer):
 
             logger.log(loss=log.mean(loss),
                        rate=log.mean(rate),
-                       distortion=log.mean(distortion*255**2),
+                       distortion=log.mean(distortion),
                        bpp_z=log.mean(bpp_z),
                        bpp_feature=log.mean(bpp_feature),
                        psnr=log.mean(psnr(clipped_recon_image, inputs)),
@@ -187,13 +192,13 @@ class Trainer(BaseTrainer):
                 clipped_recon_image, mse_loss, bpp_feature, bpp_z, bpp = self.model(
                     inputs)
                 rate = bpp
-                distortion = mse_loss
+                distortion = mse_loss*255**2
                 loss = rate_distortion_loss(
                     rate, distortion, config.lambda_loss)
 
                 logger.log(loss=log.mean(loss),
                            rate=log.mean(rate),
-                           distortion=log.mean(distortion*255**2),
+                           distortion=log.mean(distortion),
                            bpp_z=log.mean(bpp_z),
                            bpp_feature=log.mean(bpp_feature),
                            psnr=log.mean(
@@ -227,11 +232,14 @@ class Trainer(BaseTrainer):
         eval_scheduler.every(config.eval_steps).steps.do(eval_model)
 
         # TRAINING LOOP
-        for epoch in range(self.start_epoch, config.epochs):
-            logging.info('## Epoch {}/{}'.format(epoch, config.epochs - 1))
+        end_epoch = (config.steps //
+                     len(self.dataloaders['train'].dataset)) + 1
+        for epoch in range(self.start_epoch, end_epoch):
+            logging.info(f'## Epoch {epoch} / {end_epoch}')
             self._train_epoch()
             self._save_checkpoint(epoch)
-            eval_scheduler.step()
+            if schedule.steps > config.steps:
+                break
 
         logging.info(f'## Training completed! best loss = {best_result}')
 
