@@ -37,7 +37,7 @@ config_defaults = {
     'batch_size': 1,
     'lr': 1e-4,
     'steps': 1500000,
-    'eval_steps': 2000,
+    'eval_steps': 1,
 
     'lambda_loss': 0.05,
     'debug': False,
@@ -63,6 +63,7 @@ config_defaults = {
         'rate': 100,
         'distortion': 100,
         'psnr': 100,
+        'ms_ssim': 100,
         'bpp_z': 100,
         'bpp_feature': 100,
 
@@ -173,6 +174,7 @@ class Trainer(BaseTrainer):
                        bpp_z=log.mean(bpp_z),
                        bpp_feature=log.mean(bpp_feature),
                        psnr=log.mean(psnr(clipped_recon_image, inputs)),
+                       ms_ssim=log.mean(ms_ssim(clipped_recon_image, inputs)),
                        prediction=log.image(
                            torch.cat((inputs, clipped_recon_image)).unsqueeze(0), nrow=2),
                        prediction_all=log.image_grid(clipped_recon_image))
@@ -203,6 +205,8 @@ class Trainer(BaseTrainer):
                            bpp_feature=log.mean(bpp_feature),
                            psnr=log.mean(
                                psnr(clipped_recon_image, inputs)),
+                           ms_ssim=log.mean(
+                               ms_ssim(clipped_recon_image, inputs)),
                            prediction=log.image(
                                torch.cat((inputs, clipped_recon_image)).unsqueeze(0), nrow=2),
                            prediction_all=log.image_grid(clipped_recon_image))
@@ -238,6 +242,8 @@ class Trainer(BaseTrainer):
             logging.info(f'## Epoch {epoch} / {end_epoch}')
             self._train_epoch()
             self._save_checkpoint(epoch)
+            eval_scheduler.step()
+
             if schedule.steps > config.steps:
                 break
 
